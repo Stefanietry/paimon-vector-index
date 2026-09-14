@@ -34,8 +34,11 @@ use crate::ivfflat_io::{
     write_ivfflat_index, IVFFlatIndexReader, IVFFLAT_MAGIC,
 };
 use crate::ivfpq::{
+    search_batch_reader_fixed_list_roaring_filter_with_reuse_mode_and_budget,
+    search_batch_reader_fixed_list_with_reuse_mode_and_budget,
     search_batch_reader_roaring_filter_with_reuse_mode_and_budget_range,
     search_batch_reader_with_reuse_mode_and_budget_range, search_with_reader,
+    search_with_reader_fixed_list, search_with_reader_fixed_list_roaring_filter,
     search_with_reader_roaring_filter, IVFPQIndex,
 };
 pub use crate::ivfpq::{IvfPqBatchTableReuseMode, DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES};
@@ -1950,6 +1953,67 @@ impl<R: SeekRead> VectorIndexReader<R> {
         }
     }
 
+    /// Search a centroid-routed IVF-PQ shard.
+    ///
+    /// This entry point is intended for centroid-based sharding where an
+    /// external routing model has already selected the centroid. The reader
+    /// therefore does not perform another IVF centroid top-k selection from
+    /// `params.width`; instead it directly scans the inverted list identified by
+    /// `centroid` while preserving the existing IVF-PQ filtering and lazy-read
+    /// behavior. The public API accepts one centroid today because each routed
+    /// index file is expected to contain exactly one centroid shard.
+    ///
+    /// Routed search always returns exactly `top_k` rows; if the selected list
+    /// does not contain enough matching vectors, the result is padded with `-1`
+    /// ids and `f32::MAX` distances. For residual L2 IVF-PQ, the selected
+    /// centroid vector may still be used as the residual or precomputed-distance
+    /// anchor even though no coarse selection is performed.
+    pub fn search_routed_ivf_shard(
+        &mut self,
+        query: &[f32],
+        params: VectorSearchParams,
+        centroid: usize,
+    ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+        validate_query(query, self.dimension())?;
+        params.validate()?;
+        match self {
+            Self::IvfPq(reader) => {
+                validate_routed_ivf_shard(reader.nlist, centroid, params)?;
+                search_with_reader_fixed_list(reader, query, params.top_k, centroid)
+            }
+            _ => Err(invalid_input(
+                "routed IVF shard search is only available for IVF-PQ indexes",
+            )),
+        }
+    }
+
+    /// Search a centroid-routed IVF-PQ shard with a serialized RoaringTreemap row-id filter.
+    pub fn search_routed_ivf_shard_with_roaring_filter(
+        &mut self,
+        query: &[f32],
+        params: VectorSearchParams,
+        centroid: usize,
+        roaring_filter_bytes: &[u8],
+    ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+        validate_query(query, self.dimension())?;
+        params.validate()?;
+        match self {
+            Self::IvfPq(reader) => {
+                validate_routed_ivf_shard(reader.nlist, centroid, params)?;
+                search_with_reader_fixed_list_roaring_filter(
+                    reader,
+                    query,
+                    params.top_k,
+                    centroid,
+                    roaring_filter_bytes,
+                )
+            }
+            _ => Err(invalid_input(
+                "routed IVF shard search is only available for IVF-PQ indexes",
+            )),
+        }
+    }
+
     pub fn search_batch(
         &mut self,
         queries: &[f32],
@@ -2273,6 +2337,90 @@ impl<R: SeekRead> VectorIndexReader<R> {
             ),
         }
     }
+
+    /// Batch-search a centroid-routed IVF-PQ shard.
+    ///
+    /// See [`Self::search_routed_ivf_shard`] for the routed-shard semantics.
+    /// The current file layout supports exactly one routed centroid/list per
+    /// index file. Each query returns exactly `top_k` rows; short per-query
+    /// results are padded with `-1` ids and `f32::MAX` distances.
+    pub fn search_routed_ivf_shard_batch(
+        &mut self,
+        queries: &[f32],
+        query_count: usize,
+        params: VectorSearchParams,
+        centroid: usize,
+    ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+        validate_queries(queries, query_count, self.dimension())?;
+        params.validate()?;
+        match self {
+            Self::IvfPq(reader) => {
+                validate_routed_ivf_shard(reader.nlist, centroid, params)?;
+                search_batch_reader_fixed_list_with_reuse_mode_and_budget(
+                    reader,
+                    queries,
+                    query_count,
+                    params.top_k,
+                    centroid,
+                    params.ivfpq_batch_table_reuse,
+                    params.ivfpq_batch_table_reuse_max_bytes,
+                )
+            }
+            _ => Err(invalid_input(
+                "routed IVF shard search is only available for IVF-PQ indexes",
+            )),
+        }
+    }
+
+    /// Batch-search a centroid-routed IVF-PQ shard with a serialized RoaringTreemap row-id filter.
+    pub fn search_routed_ivf_shard_batch_with_roaring_filter(
+        &mut self,
+        queries: &[f32],
+        query_count: usize,
+        params: VectorSearchParams,
+        centroid: usize,
+        roaring_filter_bytes: &[u8],
+    ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+        validate_queries(queries, query_count, self.dimension())?;
+        params.validate()?;
+        match self {
+            Self::IvfPq(reader) => {
+                validate_routed_ivf_shard(reader.nlist, centroid, params)?;
+                search_batch_reader_fixed_list_roaring_filter_with_reuse_mode_and_budget(
+                    reader,
+                    queries,
+                    query_count,
+                    params.top_k,
+                    centroid,
+                    roaring_filter_bytes,
+                    params.ivfpq_batch_table_reuse,
+                    params.ivfpq_batch_table_reuse_max_bytes,
+                )
+            }
+            _ => Err(invalid_input(
+                "routed IVF shard search is only available for IVF-PQ indexes",
+            )),
+        }
+    }
+}
+
+fn validate_routed_ivf_shard(
+    nlist: usize,
+    centroid: usize,
+    params: VectorSearchParams,
+) -> io::Result<()> {
+    if centroid >= nlist {
+        return Err(invalid_input(format!(
+            "centroid {} out of range (nlist={})",
+            centroid, nlist
+        )));
+    }
+    if params.search_width == SearchWidth::DiskAnnLSearch {
+        return Err(invalid_input(
+            "DiskANN l_search cannot be used with a routed IVF shard search",
+        ));
+    }
+    Ok(())
 }
 
 fn decode_roaring_filter_cardinality(bytes: &[u8]) -> io::Result<usize> {
@@ -2815,9 +2963,357 @@ mod tests {
         VectorIndexReader::open(Cursor::new(bytes)).unwrap()
     }
 
+    fn first_non_empty_ivfpq_list(reader: &mut VectorIndexReader<Cursor<Vec<u8>>>) -> usize {
+        if let VectorIndexReader::IvfPq(reader) = reader {
+            reader.ensure_loaded().unwrap();
+            reader
+                .list_counts
+                .iter()
+                .position(|&count| count > 0)
+                .expect("test index should contain a non-empty IVF list")
+        } else {
+            panic!("expected IVF-PQ reader")
+        }
+    }
+
+    fn ivfpq_list_row_ids(
+        reader: &mut VectorIndexReader<Cursor<Vec<u8>>>,
+        list_id: usize,
+    ) -> HashSet<i64> {
+        if let VectorIndexReader::IvfPq(reader) = reader {
+            reader.ensure_loaded().unwrap();
+            reader
+                .read_inverted_list_payloads(&[list_id])
+                .unwrap()
+                .remove(0)
+                .ids
+                .into_iter()
+                .collect()
+        } else {
+            panic!("expected IVF-PQ reader")
+        }
+    }
+
     fn build_writer(config: VectorIndexConfig, data: &[f32], n: usize) -> VectorIndexWriter {
         let training = VectorIndexTrainer::train(config, data, n).unwrap();
         VectorIndexWriter::new(training)
+    }
+
+    #[test]
+    fn routed_ivfpq_shard_search_scans_requested_centroid_list() {
+        let dimension = 16;
+        let nlist = 8;
+        let (mut reader, data) = build_reader(VectorIndexConfig::IvfPq {
+            dimension,
+            nlist,
+            m: 4,
+            metric: MetricType::L2,
+            use_opq: false,
+            use_approximate_coarse_assignment: true,
+            canonical_pq_encoding: false,
+            ivf_train_max_points_per_centroid: 256,
+            pq_train_max_points_per_centroid: 256,
+        });
+        let centroid = first_non_empty_ivfpq_list(&mut reader);
+        let list_row_ids = ivfpq_list_row_ids(&mut reader, centroid);
+
+        let top_k = 5;
+        let narrow_params = VectorSearchParams::new(top_k, 1);
+        let (ids, distances) = reader
+            .search_routed_ivf_shard(&data[..dimension], narrow_params, centroid)
+            .unwrap();
+
+        assert_eq!(ids.len(), top_k);
+        assert_eq!(distances.len(), top_k);
+        assert!(ids.iter().all(|id| list_row_ids.contains(id)));
+    }
+
+    #[test]
+    fn routed_ivfpq_shard_search_preserves_roaring_filter() {
+        let dimension = 16;
+        let nlist = 4;
+        let (mut reader, data) = build_reader(VectorIndexConfig::IvfPq {
+            dimension,
+            nlist,
+            m: 4,
+            metric: MetricType::L2,
+            use_opq: false,
+            use_approximate_coarse_assignment: true,
+            canonical_pq_encoding: false,
+            ivf_train_max_points_per_centroid: 256,
+            pq_train_max_points_per_centroid: 256,
+        });
+        let mut allowed = RoaringTreemap::new();
+        for id in (0..512u64).filter(|id| id % 5 == 0) {
+            allowed.insert(id);
+        }
+        let mut filter_bytes = Vec::new();
+        allowed.serialize_into(&mut filter_bytes).unwrap();
+
+        let (ids, _distances) = reader
+            .search_routed_ivf_shard_with_roaring_filter(
+                &data[..dimension],
+                VectorSearchParams::new(8, 1),
+                0,
+                &filter_bytes,
+            )
+            .unwrap();
+
+        for id in ids {
+            assert_eq!(id % 5, 0);
+        }
+    }
+
+    #[test]
+    fn routed_ivfpq_shard_search_pads_filtered_short_results() {
+        let dimension = 16;
+        let nlist = 8;
+        let (mut reader, data) = build_reader(VectorIndexConfig::IvfPq {
+            dimension,
+            nlist,
+            m: 4,
+            metric: MetricType::L2,
+            use_opq: false,
+            use_approximate_coarse_assignment: true,
+            canonical_pq_encoding: false,
+            ivf_train_max_points_per_centroid: 256,
+            pq_train_max_points_per_centroid: 256,
+        });
+        let centroid = first_non_empty_ivfpq_list(&mut reader);
+        let only_id = *ivfpq_list_row_ids(&mut reader, centroid)
+            .iter()
+            .next()
+            .expect("test list should contain at least one row id");
+        let mut allowed = RoaringTreemap::new();
+        allowed.insert(only_id as u64);
+        let mut filter_bytes = Vec::new();
+        allowed.serialize_into(&mut filter_bytes).unwrap();
+
+        let top_k = 5;
+        let (ids, distances) = reader
+            .search_routed_ivf_shard_with_roaring_filter(
+                &data[..dimension],
+                VectorSearchParams::new(top_k, 1),
+                centroid,
+                &filter_bytes,
+            )
+            .unwrap();
+
+        assert_eq!(ids.len(), top_k);
+        assert_eq!(distances.len(), top_k);
+        assert_eq!(ids[0], only_id);
+        assert!(distances[0].is_finite());
+        assert!(ids[1..].iter().all(|&id| id == -1));
+        assert!(distances[1..].iter().all(|&distance| distance == f32::MAX));
+    }
+
+    #[test]
+    fn routed_ivfpq_shard_batch_scans_requested_centroid_list() {
+        let dimension = 16;
+        let nlist = 8;
+        let query_count = 6;
+        let (mut reader, data) = build_reader(VectorIndexConfig::IvfPq {
+            dimension,
+            nlist,
+            m: 4,
+            metric: MetricType::L2,
+            use_opq: false,
+            use_approximate_coarse_assignment: true,
+            canonical_pq_encoding: false,
+            ivf_train_max_points_per_centroid: 256,
+            pq_train_max_points_per_centroid: 256,
+        });
+        let centroid = first_non_empty_ivfpq_list(&mut reader);
+        let list_row_ids = ivfpq_list_row_ids(&mut reader, centroid);
+
+        let top_k = 4;
+        let (ids, distances) = reader
+            .search_routed_ivf_shard_batch(
+                &data[..query_count * dimension],
+                query_count,
+                VectorSearchParams::new(top_k, 1),
+                centroid,
+            )
+            .unwrap();
+
+        assert_eq!(ids.len(), query_count * top_k);
+        assert_eq!(distances.len(), query_count * top_k);
+        assert!(ids
+            .iter()
+            .filter(|&&id| id >= 0)
+            .all(|id| list_row_ids.contains(id)));
+    }
+
+    #[test]
+    fn routed_ivfpq_single_centroid_matches_regular_search() {
+        let dimension = 16;
+        let nlist = 1;
+        let (mut reader, data) = build_reader(VectorIndexConfig::IvfPq {
+            dimension,
+            nlist,
+            m: 4,
+            metric: MetricType::L2,
+            use_opq: false,
+            use_approximate_coarse_assignment: true,
+            canonical_pq_encoding: false,
+            ivf_train_max_points_per_centroid: 256,
+            pq_train_max_points_per_centroid: 256,
+        });
+
+        let top_k = 5;
+        let params = VectorSearchParams::new(top_k, 1);
+        let query = &data[..dimension];
+        let (regular_ids, regular_distances) = reader.search(query, params).unwrap();
+        let (routed_ids, routed_distances) = reader
+            .search_routed_ivf_shard(query, params, 0)
+            .expect("single-centroid routed IVF-PQ search should succeed");
+
+        assert_eq!(regular_ids, routed_ids);
+        assert_eq!(regular_distances, routed_distances);
+        assert_eq!(routed_ids[0], 0);
+
+        let err = reader
+            .search_routed_ivf_shard(query, params, 1)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn routed_ivfpq_single_centroid_batch_reads_list_once() {
+        let dimension = 16;
+        let nlist = 1;
+        let query_count = 8;
+        let n = 512;
+        let data = generate_clustered_data(n, dimension, nlist);
+        let ids = (0..n as i64).collect::<Vec<_>>();
+        let mut writer = build_writer(
+            VectorIndexConfig::IvfPq {
+                dimension,
+                nlist,
+                m: 4,
+                metric: MetricType::L2,
+                use_opq: false,
+                use_approximate_coarse_assignment: true,
+                canonical_pq_encoding: false,
+                ivf_train_max_points_per_centroid: 256,
+                pq_train_max_points_per_centroid: 256,
+            },
+            &data,
+            n,
+        );
+        writer.add_vectors(&ids, &data, n).unwrap();
+        let mut bytes = Vec::new();
+        writer.write(&mut PosWriter::new(&mut bytes)).unwrap();
+
+        let params = VectorSearchParams::new(5, 1)
+            .with_ivfpq_batch_table_reuse(IvfPqBatchTableReuseMode::Off);
+        let mut expected_reader = VectorIndexReader::open(Cursor::new(bytes.clone())).unwrap();
+        let expected = (0..query_count)
+            .map(|query_index| {
+                expected_reader
+                    .search_routed_ivf_shard(
+                        &data[query_index * dimension..(query_index + 1) * dimension],
+                        params,
+                        0,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = CountingReader {
+            inner: Cursor::new(bytes),
+            calls: Arc::clone(&calls),
+        };
+        let mut reader = VectorIndexReader::open(source).unwrap();
+        let calls_after_open = calls.load(Ordering::Relaxed);
+
+        let (batch_ids, batch_distances) = reader
+            .search_routed_ivf_shard_batch(&data[..query_count * dimension], query_count, params, 0)
+            .unwrap();
+
+        assert_eq!(batch_ids.len(), query_count * params.top_k);
+        assert_eq!(batch_distances.len(), query_count * params.top_k);
+        for (query_index, (expected_ids, expected_distances)) in expected.iter().enumerate() {
+            let start = query_index * params.top_k;
+            let mut actual_ids = batch_ids[start..start + params.top_k].to_vec();
+            let mut expected_ids = expected_ids.clone();
+            actual_ids.sort_unstable();
+            expected_ids.sort_unstable();
+            assert_eq!(actual_ids, expected_ids);
+            for (&actual, &expected) in batch_distances[start..start + params.top_k]
+                .iter()
+                .zip(expected_distances)
+            {
+                assert!((actual - expected).abs() <= 1e-5);
+            }
+        }
+        assert_eq!(
+            calls.load(Ordering::Relaxed) - calls_after_open,
+            2,
+            "routed single-list batch search should read metadata and the list payload once"
+        );
+    }
+
+    #[test]
+    fn routed_ivfpq_shard_search_validates_centroid_and_index_type() {
+        let mut ivfpq_reader = build_reader(VectorIndexConfig::IvfPq {
+            dimension: 16,
+            nlist: 4,
+            m: 4,
+            metric: MetricType::L2,
+            use_opq: false,
+            use_approximate_coarse_assignment: true,
+            canonical_pq_encoding: false,
+            ivf_train_max_points_per_centroid: 256,
+            pq_train_max_points_per_centroid: 256,
+        })
+        .0;
+
+        let err = ivfpq_reader
+            .search_routed_ivf_shard(&[0.0; 16], VectorSearchParams::new(1, 1), 4)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let err = ivfpq_reader
+            .search_routed_ivf_shard(&[0.0; 16], VectorSearchParams::with_l_search(1, 10), 0)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let mut ivfflat_reader = build_ivfflat_reader();
+        let err = ivfflat_reader
+            .search_routed_ivf_shard(&[0.0], VectorSearchParams::new(1, 1), 0)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn routed_ivfpq_inner_product_full_scan_does_not_require_coarse_centroid_selection() {
+        let dimension = 16;
+        let nlist = 8;
+        let (mut reader, data) = build_reader(VectorIndexConfig::IvfPq {
+            dimension,
+            nlist,
+            m: 4,
+            metric: MetricType::InnerProduct,
+            use_opq: false,
+            use_approximate_coarse_assignment: true,
+            canonical_pq_encoding: false,
+            ivf_train_max_points_per_centroid: 256,
+            pq_train_max_points_per_centroid: 256,
+        });
+        let centroid = first_non_empty_ivfpq_list(&mut reader);
+
+        if let VectorIndexReader::IvfPq(reader) = &mut reader {
+            reader.ensure_loaded().unwrap();
+            reader.quantizer_centroids.clear();
+        }
+
+        let (ids, distances) = reader
+            .search_routed_ivf_shard(&data[..dimension], VectorSearchParams::new(4, 1), centroid)
+            .unwrap();
+        assert_eq!(ids.len(), 4);
+        assert_eq!(distances.len(), 4);
     }
 
     #[test]

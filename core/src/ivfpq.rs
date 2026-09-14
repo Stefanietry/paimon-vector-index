@@ -17,8 +17,8 @@
 
 use crate::coarse::CoarseAssignment;
 use crate::distance::{
-    fvec_inner_product, fvec_madd, fvec_normalize, pq_distance_four_codes, pq_distance_from_table,
-    MetricType,
+    fvec_inner_product, fvec_l2sqr, fvec_madd, fvec_normalize, pq_distance_four_codes,
+    pq_distance_from_table, MetricType,
 };
 use crate::index_io_util::ivf_payload_is_oversized;
 use crate::io::{IVFPQIndexReader, InvertedListPayload, SeekRead};
@@ -1458,12 +1458,93 @@ pub fn search_with_reader<R: SeekRead>(
     search_with_reader_filter(reader, query, k, nprobe, None)
 }
 
+/// Search one explicitly selected IVF-PQ inverted list using a lazy reader.
+///
+/// Routed searches always return exactly `k` rows; if the selected list does not
+/// contain enough matching vectors, the result is padded with `-1` ids and
+/// `f32::MAX` distances.
+pub(crate) fn search_with_reader_fixed_list<R: SeekRead>(
+    reader: &mut IVFPQIndexReader<R>,
+    query: &[f32],
+    k: usize,
+    list_id: usize,
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    search_with_reader_filter_fixed_list(reader, query, k, list_id, None)
+}
+
 /// Search with optional ID filter using a lazy reader.
 pub fn search_with_reader_filter<R: SeekRead>(
     reader: &mut IVFPQIndexReader<R>,
     query: &[f32],
     k: usize,
     nprobe: usize,
+    filter: Option<&dyn RowIdFilter>,
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    search_with_reader_filter_impl(reader, query, k, nprobe, None, filter)
+}
+
+/// Search one explicitly selected IVF-PQ inverted list with optional ID filter.
+///
+/// Routed searches always return exactly `k` rows; if the selected list does not
+/// contain enough matching vectors, the result is padded with `-1` ids and
+/// `f32::MAX` distances.
+pub(crate) fn search_with_reader_filter_fixed_list<R: SeekRead>(
+    reader: &mut IVFPQIndexReader<R>,
+    query: &[f32],
+    k: usize,
+    list_id: usize,
+    filter: Option<&dyn RowIdFilter>,
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    let (mut ids, mut distances) =
+        search_with_reader_filter_impl(reader, query, k, 0, Some(list_id), filter)?;
+    pad_search_result_to_k(&mut ids, &mut distances, k);
+    Ok((ids, distances))
+}
+
+fn pad_search_result_to_k(ids: &mut Vec<i64>, distances: &mut Vec<f32>, k: usize) {
+    ids.resize(k, -1);
+    distances.resize(k, f32::MAX);
+}
+
+fn collect_fixed_reader_list<R: SeekRead>(
+    reader: &IVFPQIndexReader<R>,
+    list_id: usize,
+    q: &[f32],
+    d: usize,
+    use_precomputed: bool,
+) -> io::Result<Vec<(usize, usize, f32)>> {
+    validate_reader_list_id(reader.nlist, list_id)?;
+    let count = reader.list_counts[list_id] as usize;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let dis0 = if use_precomputed {
+        fvec_l2sqr(
+            q,
+            &reader.quantizer_centroids[list_id * d..(list_id + 1) * d],
+        )
+    } else {
+        0.0
+    };
+    Ok(vec![(list_id, count, dis0)])
+}
+
+fn validate_reader_list_id(nlist: usize, list_id: usize) -> io::Result<()> {
+    if list_id < nlist {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("IVF list {} out of range (nlist={})", list_id, nlist),
+    ))
+}
+
+fn search_with_reader_filter_impl<R: SeekRead>(
+    reader: &mut IVFPQIndexReader<R>,
+    query: &[f32],
+    k: usize,
+    nprobe: usize,
+    fixed_list_id: Option<usize>,
     filter: Option<&dyn RowIdFilter>,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
     reader.ensure_loaded()?;
@@ -1484,7 +1565,7 @@ pub fn search_with_reader_filter<R: SeekRead>(
             "k must be greater than 0",
         ));
     }
-    if nprobe == 0 {
+    if fixed_list_id.is_none() && nprobe == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "nprobe must be greater than 0",
@@ -1507,9 +1588,6 @@ pub fn search_with_reader_filter<R: SeekRead>(
         q = rotated;
     }
 
-    let (probe_indices, coarse_dists) =
-        kmeans::find_topk(&q, &reader.quantizer_centroids, reader.nlist, d, nprobe);
-
     let use_precomputed =
         metric == MetricType::L2 && by_residual && !reader.precomputed_table.is_empty();
     let ip_table = if use_precomputed {
@@ -1523,19 +1601,26 @@ pub fn search_with_reader_filter<R: SeekRead>(
 
     let mut heap = TopKHeap::new(k);
 
-    let mut lists_to_read = Vec::new();
-    for (probe_idx, &list_id) in probe_indices.iter().enumerate() {
-        let count = reader.list_counts[list_id] as usize;
-        if count == 0 {
-            continue;
+    let mut lists_to_read = if let Some(list_id) = fixed_list_id {
+        collect_fixed_reader_list(reader, list_id, &q, d, use_precomputed)?
+    } else {
+        let (probe_indices, coarse_dists) =
+            kmeans::find_topk(&q, &reader.quantizer_centroids, reader.nlist, d, nprobe);
+        let mut lists_to_read = Vec::new();
+        for (probe_idx, &list_id) in probe_indices.iter().enumerate() {
+            let count = reader.list_counts[list_id] as usize;
+            if count == 0 {
+                continue;
+            }
+            let dis0 = if use_precomputed {
+                coarse_dists[probe_idx]
+            } else {
+                0.0
+            };
+            lists_to_read.push((list_id, count, dis0));
         }
-        let dis0 = if use_precomputed {
-            coarse_dists[probe_idx]
-        } else {
-            0.0
-        };
-        lists_to_read.push((list_id, count, dis0));
-    }
+        lists_to_read
+    };
     lists_to_read.sort_unstable_by_key(|&(list_id, _, _)| reader.list_offsets[list_id]);
 
     let read_list_ids = lists_to_read
@@ -1663,6 +1748,18 @@ pub fn search_with_reader_roaring_filter<R: SeekRead>(
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
     let filter = decode_roaring_filter(roaring_filter_bytes)?;
     search_with_reader_filter(reader, query, k, nprobe, Some(&filter))
+}
+
+/// Search explicitly selected IVF-PQ inverted lists with a serialized RoaringTreemap row-id filter.
+pub(crate) fn search_with_reader_fixed_list_roaring_filter<R: SeekRead>(
+    reader: &mut IVFPQIndexReader<R>,
+    query: &[f32],
+    k: usize,
+    list_id: usize,
+    roaring_filter_bytes: &[u8],
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    let filter = decode_roaring_filter(roaring_filter_bytes)?;
+    search_with_reader_filter_fixed_list(reader, query, k, list_id, Some(&filter))
 }
 
 fn scan_reader_list(
@@ -2038,6 +2135,107 @@ pub(crate) fn search_batch_reader_with_reuse_mode_and_budget_range<R: SeekRead>(
     )
 }
 
+pub(crate) fn search_batch_reader_fixed_list_with_reuse_mode_and_budget<R: SeekRead>(
+    reader: &mut IVFPQIndexReader<R>,
+    queries: &[f32],
+    nq: usize,
+    k: usize,
+    list_id: usize,
+    reuse_mode: IvfPqBatchTableReuseMode,
+    reuse_max_bytes: usize,
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    search_batch_reader_filter_fixed_list(
+        reader,
+        queries,
+        nq,
+        k,
+        list_id,
+        None,
+        reuse_mode,
+        reuse_max_bytes,
+    )
+}
+
+fn search_batch_reader_filter_fixed_list<R: SeekRead>(
+    reader: &mut IVFPQIndexReader<R>,
+    queries: &[f32],
+    nq: usize,
+    k: usize,
+    list_id: usize,
+    filter: Option<&dyn RowIdFilter>,
+    reuse_mode: IvfPqBatchTableReuseMode,
+    reuse_max_bytes: usize,
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    search_batch_reader_filter_with_reuse_mode_and_observer_impl(
+        reader,
+        queries,
+        nq,
+        k,
+        0,
+        1,
+        &[],
+        &[],
+        filter,
+        reuse_mode,
+        reuse_max_bytes,
+        Some(list_id),
+        |_| {},
+        #[cfg(test)]
+        None,
+    )
+}
+
+fn validate_batch_reader_query_shape<R: SeekRead>(
+    reader: &IVFPQIndexReader<R>,
+    queries: &[f32],
+    nq: usize,
+) -> io::Result<usize> {
+    if nq == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "nq must be greater than 0",
+        ));
+    }
+    let expected_query_len = nq.checked_mul(reader.d).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "nq * dimension overflows usize",
+        )
+    })?;
+    if queries.len() != expected_query_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "queries length {} does not match nq * dimension {}",
+                queries.len(),
+                expected_query_len
+            ),
+        ));
+    }
+    Ok(expected_query_len)
+}
+
+fn preprocess_batch_reader_queries<R: SeekRead>(
+    reader: &IVFPQIndexReader<R>,
+    queries: &[f32],
+    nq: usize,
+    expected_query_len: usize,
+) -> Vec<f32> {
+    let d = reader.d;
+    let mut processed = queries[..expected_query_len].to_vec();
+    if reader.metric == MetricType::Cosine {
+        for qi in 0..nq {
+            fvec_normalize(&mut processed[qi * d..(qi + 1) * d]);
+        }
+    }
+    if let Some(ref opq) = reader.opq {
+        let mut rotated = vec![0.0f32; expected_query_len];
+        opq.apply_batch(&processed, &mut rotated, nq);
+        processed = rotated;
+    }
+    processed
+}
+
 fn search_batch_reader_filter_with_reuse_mode_and_budget_range<R: SeekRead>(
     reader: &mut IVFPQIndexReader<R>,
     queries: &[f32],
@@ -2177,6 +2375,42 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
     mut observe_ephemeral_precomputed_lists: impl FnMut(usize),
     #[cfg(test)] distance_table_builds: Option<&std::sync::atomic::AtomicUsize>,
 ) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    search_batch_reader_filter_with_reuse_mode_and_observer_impl(
+        reader,
+        queries,
+        nq,
+        k,
+        probe_start,
+        probe_end,
+        seed_ids,
+        seed_distances,
+        filter,
+        reuse_mode,
+        reuse_max_bytes,
+        None,
+        &mut observe_ephemeral_precomputed_lists,
+        #[cfg(test)]
+        distance_table_builds,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_batch_reader_filter_with_reuse_mode_and_observer_impl<R: SeekRead>(
+    reader: &mut IVFPQIndexReader<R>,
+    queries: &[f32],
+    nq: usize,
+    k: usize,
+    probe_start: usize,
+    probe_end: usize,
+    seed_ids: &[i64],
+    seed_distances: &[f32],
+    filter: Option<&dyn RowIdFilter>,
+    reuse_mode: IvfPqBatchTableReuseMode,
+    reuse_max_bytes: usize,
+    fixed_list_id: Option<usize>,
+    mut observe_ephemeral_precomputed_lists: impl FnMut(usize),
+    #[cfg(test)] distance_table_builds: Option<&std::sync::atomic::AtomicUsize>,
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
     let timing_enabled = std::env::var_os("PAIMON_VINDEX_LOG_IVFPQ_BATCH_TIMING").is_some();
     let total_started = timing_enabled.then(Instant::now);
     let mut timing = IvfpqBatchTiming::default();
@@ -2184,28 +2418,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
     reader.ensure_loaded()?;
     timing.load = elapsed_since(load_started);
     let d = reader.d;
-    if nq == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "nq must be greater than 0",
-        ));
-    }
-    let expected_query_len = nq.checked_mul(d).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "nq * dimension overflows usize",
-        )
-    })?;
-    if queries.len() != expected_query_len {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "queries length {} does not match nq * dimension {}",
-                queries.len(),
-                expected_query_len
-            ),
-        ));
-    }
+    let expected_query_len = validate_batch_reader_query_shape(reader, queries, nq)?;
     if k == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -2225,32 +2438,48 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
     let ksub = reader.ksub;
     let metric = reader.metric;
     let by_residual = reader.by_residual;
+    let reuse_required_bytes = nq
+        .checked_mul(m)
+        .and_then(|values| values.checked_mul(ksub))
+        .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()));
+    let reused_query_tables_fit_budget =
+        reuse_required_bytes.is_some_and(|bytes| bytes <= reuse_max_bytes);
+    let use_precomputed = reuse_mode != IvfPqBatchTableReuseMode::Off
+        && metric == MetricType::L2
+        && by_residual
+        && !reader.precomputed_table.is_empty()
+        && reused_query_tables_fit_budget;
 
     // Step 1: Preprocess all queries
     let preprocess_started = timing_enabled.then(Instant::now);
-    let mut processed = queries[..nq * d].to_vec();
-    if metric == MetricType::Cosine {
-        for i in 0..nq {
-            fvec_normalize(&mut processed[i * d..(i + 1) * d]);
-        }
-    }
-    if let Some(ref opq) = reader.opq {
-        let mut rotated = vec![0.0f32; nq * d];
-        opq.apply_batch(&processed, &mut rotated, nq);
-        processed = rotated;
-    }
+    let processed = preprocess_batch_reader_queries(reader, queries, nq, expected_query_len);
     timing.preprocess = elapsed_since(preprocess_started);
 
-    // Step 2: Batch coarse search (one sgemm)
+    // Step 2: Build per-query list plan. Regular batch queries perform one
+    // batched coarse search, while centroid-routed shards already know their
+    // only target list and can skip coarse selection.
     let coarse_started = timing_enabled.then(Instant::now);
-    let (all_probe_indices, all_coarse_dists) = kmeans::find_topk_batch(
-        &processed,
-        nq,
-        &reader.quantizer_centroids,
-        reader.nlist,
-        d,
-        probe_end,
-    );
+    let (all_probe_indices, all_coarse_dists) = if let Some(list_id) = fixed_list_id {
+        validate_reader_list_id(reader.nlist, list_id)?;
+        let coarse_dists = if use_precomputed {
+            let centroid = &reader.quantizer_centroids[list_id * d..(list_id + 1) * d];
+            (0..nq)
+                .map(|qi| vec![fvec_l2sqr(&processed[qi * d..(qi + 1) * d], centroid)])
+                .collect::<Vec<_>>()
+        } else {
+            vec![vec![0.0]; nq]
+        };
+        (vec![vec![list_id]; nq], coarse_dists)
+    } else {
+        kmeans::find_topk_batch(
+            &processed,
+            nq,
+            &reader.quantizer_centroids,
+            reader.nlist,
+            d,
+            probe_end,
+        )
+    };
     timing.coarse = elapsed_since(coarse_started);
 
     // Step 3: Read every probed list once. Queries share the decoded list
@@ -2281,17 +2510,6 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
     }
     unique_lists.sort_unstable_by_key(|&list_id| reader.list_offsets[list_id]);
 
-    let reuse_required_bytes = nq
-        .checked_mul(m)
-        .and_then(|values| values.checked_mul(ksub))
-        .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()));
-    let reused_query_tables_fit_budget =
-        reuse_required_bytes.is_some_and(|bytes| bytes <= reuse_max_bytes);
-    let use_precomputed = reuse_mode != IvfPqBatchTableReuseMode::Off
-        && metric == MetricType::L2
-        && by_residual
-        && !reader.precomputed_table.is_empty()
-        && reused_query_tables_fit_budget;
     let allow_ephemeral_precomputed = reader.pq.nbits() == 8
         && metric == MetricType::L2
         && by_residual
@@ -2824,6 +3042,31 @@ pub(crate) fn search_batch_reader_roaring_filter_with_reuse_mode_and_budget_rang
     )
 }
 
+pub(crate) fn search_batch_reader_fixed_list_roaring_filter_with_reuse_mode_and_budget<
+    R: SeekRead,
+>(
+    reader: &mut IVFPQIndexReader<R>,
+    queries: &[f32],
+    nq: usize,
+    k: usize,
+    list_id: usize,
+    roaring_filter_bytes: &[u8],
+    reuse_mode: IvfPqBatchTableReuseMode,
+    reuse_max_bytes: usize,
+) -> io::Result<(Vec<i64>, Vec<f32>)> {
+    let filter = decode_roaring_filter(roaring_filter_bytes)?;
+    search_batch_reader_filter_fixed_list(
+        reader,
+        queries,
+        nq,
+        k,
+        list_id,
+        Some(&filter),
+        reuse_mode,
+        reuse_max_bytes,
+    )
+}
+
 // --- Top-K Heap ---
 
 struct TopKHeap {
@@ -2981,6 +3224,15 @@ mod tests {
             self.contains_calls.fetch_add(1, Ordering::Relaxed);
             id % 7 == 0
         }
+    }
+
+    #[test]
+    fn routed_list_validation_rejects_out_of_range_centroid() {
+        assert!(validate_reader_list_id(1, 0).is_ok());
+
+        let err = validate_reader_list_id(1, 1).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("IVF list 1 out of range"));
     }
 
     #[derive(Default)]

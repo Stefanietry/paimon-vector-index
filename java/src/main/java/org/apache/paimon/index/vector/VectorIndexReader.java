@@ -174,6 +174,51 @@ public final class VectorIndexReader implements AutoCloseable {
         }
     }
 
+    /**
+     * Searches one routed IVF-PQ centroid list.
+     *
+     * <p>The result always contains {@code params.topK()} entries. If the selected list has fewer
+     * matches, missing rows are padded with id {@code -1} and distance {@code Float.MAX_VALUE}.
+     * Residual L2 IVF-PQ indexes may still use the selected centroid vector as the residual
+     * distance anchor.
+     */
+    public VectorSearchResult searchRoutedIvfShard(
+            float[] query, VectorSearchParams params, int centroid) {
+        validateQuery(query);
+        validateParams(params);
+        validateCentroid(centroid);
+        rejectCallbackReentry();
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.searchRoutedIvfShard(
+                        requireOpen(), query, params, centroid);
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
+    public VectorSearchResult searchRoutedIvfShard(
+            float[] query, VectorSearchParams params, int centroid, byte[] roaringFilter) {
+        validateQuery(query);
+        validateParams(params);
+        validateCentroid(centroid);
+        if (roaringFilter == null) {
+            throw new NullPointerException("roaringFilter");
+        }
+        rejectCallbackReentry();
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.searchRoutedIvfShardWithRoaringFilter(
+                        requireOpen(), query, params, centroid, roaringFilter);
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
     public VectorSearchBatchResult searchBatch(
             float[] queries, int queryCount, VectorSearchParams params) {
         if (queries == null) {
@@ -212,6 +257,57 @@ public final class VectorIndexReader implements AutoCloseable {
         }
     }
 
+    /**
+     * Batch-searches one routed IVF-PQ centroid list.
+     *
+     * <p>Each query always returns {@code params.topK()} entries. Short per-query results are
+     * padded with id {@code -1} and distance {@code Float.MAX_VALUE}.
+     */
+    public VectorSearchBatchResult searchRoutedIvfShardBatch(
+            float[] queries, int queryCount, VectorSearchParams params, int centroid) {
+        if (queries == null) {
+            throw new NullPointerException("queries");
+        }
+        validateParams(params);
+        validateCentroid(centroid);
+        rejectCallbackReentry();
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.searchRoutedIvfShardBatch(
+                        requireOpen(), queries, queryCount, params, centroid);
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
+    public VectorSearchBatchResult searchRoutedIvfShardBatch(
+            float[] queries,
+            int queryCount,
+            VectorSearchParams params,
+            int centroid,
+            byte[] roaringFilter) {
+        if (queries == null) {
+            throw new NullPointerException("queries");
+        }
+        validateParams(params);
+        validateCentroid(centroid);
+        if (roaringFilter == null) {
+            throw new NullPointerException("roaringFilter");
+        }
+        rejectCallbackReentry();
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                return VectorIndexNative.searchRoutedIvfShardBatchWithRoaringFilter(
+                        requireOpen(), queries, queryCount, params, centroid, roaringFilter);
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
     @Override
     public void close() {
         rejectCallbackReentry();
@@ -238,6 +334,12 @@ public final class VectorIndexReader implements AutoCloseable {
     private void validateParams(VectorSearchParams params) {
         if (params == null) {
             throw new NullPointerException("params");
+        }
+    }
+
+    private void validateCentroid(int centroid) {
+        if (centroid < 0) {
+            throw new IllegalArgumentException("centroid must be non-negative");
         }
     }
 

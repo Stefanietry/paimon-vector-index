@@ -977,6 +977,88 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
 }
 
 #[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_searchRoutedIvfShard(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    query: JFloatArray,
+    params: JObject,
+    centroid: jint,
+) -> jobject {
+    jni_call(env, |env| {
+        let reader = match deref_reader(ptr) {
+            Some(reader) => reader,
+            None => return throw_and_return(env, "null native pointer (reader already freed?)"),
+        };
+        if centroid < 0 {
+            return throw_and_return(env, &format!("invalid centroid: {}", centroid));
+        }
+        let params = match search_params(env, params) {
+            Ok(params) => params,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let query_buf = match read_float_array(env, &query, "query") {
+            Ok(buf) => buf,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let (ids, dists) =
+            match reader.search_routed_ivf_shard(&query_buf, params, centroid as usize) {
+                Ok(result) => result,
+                Err(e) => return throw_and_return(env, &format!("search_routed_ivf_shard: {}", e)),
+            };
+        build_result(env, ids, dists)
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_searchRoutedIvfShardWithRoaringFilter(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    query: JFloatArray,
+    params: JObject,
+    centroid: jint,
+    roaring_filter: JByteArray,
+) -> jobject {
+    jni_call(env, |env| {
+        let reader = match deref_reader(ptr) {
+            Some(reader) => reader,
+            None => return throw_and_return(env, "null native pointer (reader already freed?)"),
+        };
+        if centroid < 0 {
+            return throw_and_return(env, &format!("invalid centroid: {}", centroid));
+        }
+        let params = match search_params(env, params) {
+            Ok(params) => params,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let query_buf = match read_float_array(env, &query, "query") {
+            Ok(buf) => buf,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let filter_bytes = match read_byte_array(env, roaring_filter) {
+            Ok(bytes) => bytes,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let (ids, dists) = match reader.search_routed_ivf_shard_with_roaring_filter(
+            &query_buf,
+            params,
+            centroid as usize,
+            &filter_bytes,
+        ) {
+            Ok(result) => result,
+            Err(e) => {
+                return throw_and_return(
+                    env,
+                    &format!("search_routed_ivf_shard_with_filter: {}", e),
+                )
+            }
+        };
+        build_result(env, ids, dists)
+    })
+}
+
+#[no_mangle]
 pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_searchBatch(
     env: JNIEnv,
     _class: JClass,
@@ -1048,6 +1130,101 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_sea
                     return throw_and_return(env, &format!("search_batch_with_filter: {}", e))
                 }
             };
+        build_batch_result(env, ids, dists, nq, params.top_k)
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_searchRoutedIvfShardBatch(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    queries: JFloatArray,
+    query_count: jint,
+    params: JObject,
+    centroid: jint,
+) -> jobject {
+    jni_call(env, |env| {
+        let reader = match deref_reader(ptr) {
+            Some(reader) => reader,
+            None => return throw_and_return(env, "null native pointer (reader already freed?)"),
+        };
+        if query_count < 0 {
+            return throw_and_return(env, &format!("invalid query count: {}", query_count));
+        }
+        if centroid < 0 {
+            return throw_and_return(env, &format!("invalid centroid: {}", centroid));
+        }
+        let params = match search_params(env, params) {
+            Ok(params) => params,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let nq = query_count as usize;
+        let query_buf = match read_float_array(env, &queries, "queries") {
+            Ok(buf) => buf,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let (ids, dists) =
+            match reader.search_routed_ivf_shard_batch(&query_buf, nq, params, centroid as usize) {
+                Ok(result) => result,
+                Err(e) => {
+                    return throw_and_return(env, &format!("search_routed_ivf_shard_batch: {}", e))
+                }
+            };
+        build_batch_result(env, ids, dists, nq, params.top_k)
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_searchRoutedIvfShardBatchWithRoaringFilter(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    queries: JFloatArray,
+    query_count: jint,
+    params: JObject,
+    centroid: jint,
+    roaring_filter: JByteArray,
+) -> jobject {
+    jni_call(env, |env| {
+        let reader = match deref_reader(ptr) {
+            Some(reader) => reader,
+            None => return throw_and_return(env, "null native pointer (reader already freed?)"),
+        };
+        if query_count < 0 {
+            return throw_and_return(env, &format!("invalid query count: {}", query_count));
+        }
+        if centroid < 0 {
+            return throw_and_return(env, &format!("invalid centroid: {}", centroid));
+        }
+        let params = match search_params(env, params) {
+            Ok(params) => params,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let nq = query_count as usize;
+        let query_buf = match read_float_array(env, &queries, "queries") {
+            Ok(buf) => buf,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let filter_bytes = match read_byte_array(env, roaring_filter) {
+            Ok(bytes) => bytes,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let (ids, dists) = match reader.search_routed_ivf_shard_batch_with_roaring_filter(
+            &query_buf,
+            nq,
+            params,
+            centroid as usize,
+            &filter_bytes,
+        ) {
+            Ok(result) => result,
+            Err(e) => {
+                return throw_and_return(
+                    env,
+                    &format!("search_routed_ivf_shard_batch_with_filter: {}", e),
+                )
+            }
+        };
         build_batch_result(env, ids, dists, nq, params.top_k)
     })
 }

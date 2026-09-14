@@ -66,6 +66,16 @@ final class VectorIndexNative {
     static native VectorSearchResult searchWithRoaringFilter(
             long ptr, float[] query, VectorSearchParams params, byte[] roaringFilter);
 
+    static native VectorSearchResult searchRoutedIvfShard(
+            long ptr, float[] query, VectorSearchParams params, int centroid);
+
+    static native VectorSearchResult searchRoutedIvfShardWithRoaringFilter(
+            long ptr,
+            float[] query,
+            VectorSearchParams params,
+            int centroid,
+            byte[] roaringFilter);
+
     static native VectorSearchBatchResult searchBatch(
             long ptr, float[] queries, int queryCount, VectorSearchParams params);
 
@@ -74,6 +84,17 @@ final class VectorIndexNative {
             float[] queries,
             int queryCount,
             VectorSearchParams params,
+            byte[] roaringFilter);
+
+    static native VectorSearchBatchResult searchRoutedIvfShardBatch(
+            long ptr, float[] queries, int queryCount, VectorSearchParams params, int centroid);
+
+    static native VectorSearchBatchResult searchRoutedIvfShardBatchWithRoaringFilter(
+            long ptr,
+            float[] queries,
+            int queryCount,
+            VectorSearchParams params,
+            int centroid,
             byte[] roaringFilter);
 
     static native void freeReader(long ptr);

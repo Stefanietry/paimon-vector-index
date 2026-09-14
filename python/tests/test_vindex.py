@@ -389,6 +389,83 @@ def test_python_ffi_batch_search():
         assert ids[1, 0] == 1
 
 
+def test_python_ivfpq_routed_single_centroid_search_matches_regular_search():
+    index_bytes, data = build_index(
+        {
+            "index.type": "ivf_pq",
+            "dimension": "16",
+            "nlist": "1",
+            "metric": "l2",
+            "use-opq": "false",
+            "ivf.pq-encoding": "canonical",
+        },
+        16,
+    )
+
+    with reader_from_bytes(index_bytes) as reader:
+        params = SearchParams.ivf(top_k=5, nprobe=1)
+        regular_ids, regular_distances = reader.search(data[0], params)
+        routed_ids, routed_distances = reader.search_routed_ivf_shard(
+            data[0], params, 0
+        )
+
+        assert routed_ids.shape == (5,)
+        assert routed_distances.shape == (5,)
+        np.testing.assert_array_equal(routed_ids, regular_ids)
+        np.testing.assert_allclose(routed_distances, regular_distances, rtol=0, atol=1e-5)
+        assert routed_ids[0] == 0
+
+        with pytest.raises(RuntimeError, match="out of range"):
+            reader.search_routed_ivf_shard(data[0], params, 1)
+        with pytest.raises(ValueError, match="centroid"):
+            reader.search_routed_ivf_shard(data[0], params, -1)
+
+
+def test_python_ivfpq_routed_single_centroid_batch_matches_regular_batch():
+    index_bytes, data = build_index(
+        {
+            "index.type": "ivf_pq",
+            "dimension": "16",
+            "nlist": "1",
+            "metric": "l2",
+            "use-opq": "false",
+            "ivf.pq-encoding": "canonical",
+        },
+        16,
+    )
+
+    with reader_from_bytes(index_bytes) as reader:
+        params = SearchParams.ivf(
+            top_k=4,
+            nprobe=1,
+            ivfpq_batch_table_reuse=IvfPqBatchTableReuseMode.OFF,
+            ivfpq_batch_table_reuse_max_bytes=1,
+        )
+        queries = data[:3]
+        regular_ids, regular_distances = reader.search_batch(queries, params)
+        routed_ids, routed_distances = reader.search_routed_ivf_shard_batch(
+            queries, params, 0
+        )
+
+        assert routed_ids.shape == (3, 4)
+        assert routed_distances.shape == (3, 4)
+        np.testing.assert_array_equal(
+            np.sort(routed_ids, axis=1), np.sort(regular_ids, axis=1)
+        )
+        np.testing.assert_allclose(
+            np.sort(routed_distances, axis=1),
+            np.sort(regular_distances, axis=1),
+            rtol=0,
+            atol=1e-5,
+        )
+        np.testing.assert_array_equal(routed_ids[:, 0], np.arange(3, dtype=np.int64))
+
+        with pytest.raises(RuntimeError, match="out of range"):
+            reader.search_routed_ivf_shard_batch(queries, params, 1)
+        with pytest.raises(ValueError, match="centroid"):
+            reader.search_routed_ivf_shard_batch(queries, params, -1)
+
+
 def test_python_diskann_latency_hint_selects_coalesced_read_plan():
     index_bytes, data = build_index(
         {

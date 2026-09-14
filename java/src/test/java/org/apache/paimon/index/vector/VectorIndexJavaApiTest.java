@@ -276,7 +276,20 @@ public class VectorIndexJavaApiTest {
         assertThrows(IllegalStateException.class, new ThrowingRunnable() {
             @Override
             public void run() {
+                reader.searchRoutedIvfShard(new float[] {0.0f}, new VectorSearchParams(1, 1), 0);
+            }
+        });
+        assertThrows(IllegalStateException.class, new ThrowingRunnable() {
+            @Override
+            public void run() {
                 reader.searchBatch(new float[] {0.0f}, 1, new VectorSearchParams(1, 1));
+            }
+        });
+        assertThrows(IllegalStateException.class, new ThrowingRunnable() {
+            @Override
+            public void run() {
+                reader.searchRoutedIvfShardBatch(
+                        new float[] {0.0f}, 1, new VectorSearchParams(1, 1), 0);
             }
         });
     }
@@ -375,6 +388,8 @@ public class VectorIndexJavaApiTest {
             reader.search(new float[] {0.0f, 1.0f}, diskAnnParams);
             reader.search(new float[] {0.0f, 1.0f}, params, new byte[] {1, 2});
             reader.search(new float[] {0.0f, 1.0f}, diskAnnParams, new byte[] {1, 2});
+            reader.searchRoutedIvfShard(new float[] {0.0f, 1.0f}, params, 0);
+            reader.searchRoutedIvfShard(new float[] {0.0f, 1.0f}, params, 0, new byte[] {1, 2});
             reader.searchBatch(new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, params);
             reader.searchBatch(
                     new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, diskAnnParams);
@@ -383,6 +398,14 @@ public class VectorIndexJavaApiTest {
                     new float[] {0.0f, 1.0f, 2.0f, 3.0f},
                     2,
                     diskAnnParams,
+                    new byte[] {1, 2});
+            reader.searchRoutedIvfShardBatch(
+                    new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2, params, 0);
+            reader.searchRoutedIvfShardBatch(
+                    new float[] {0.0f, 1.0f, 2.0f, 3.0f},
+                    2,
+                    params,
+                    0,
                     new byte[] {1, 2});
             VectorIndexTraining training =
                     VectorIndexTrainer.train(options, new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2);

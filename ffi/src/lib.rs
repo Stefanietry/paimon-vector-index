@@ -1149,6 +1149,67 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_with_roaring_filter_ex(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_reader_search_routed_ivf_shard_ex(
+    handle: *mut PaimonVindexReaderHandle,
+    query: *const f32,
+    params: *const PaimonVindexSearchParamsEx,
+    centroid: usize,
+    out_ids: *mut i64,
+    out_distances: *mut f32,
+    result_len: usize,
+) -> c_int {
+    ffi_status(|| {
+        let handle = unsafe { reader_mut(handle) }?;
+        let query = unsafe { const_slice(query, handle.inner.dimension(), "query") }?;
+        let params = unsafe { search_params_ex_from_ffi(params) }?;
+        let (ids, distances) = handle
+            .inner
+            .search_routed_ivf_shard(query, params, centroid)
+            .map_err(|e| format!("search_routed_ivf_shard: {}", e))?;
+        copy_search_result(
+            &ids,
+            &distances,
+            out_ids,
+            out_distances,
+            result_len,
+            params.top_k,
+        )
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_reader_search_routed_ivf_shard_with_roaring_filter_ex(
+    handle: *mut PaimonVindexReaderHandle,
+    query: *const f32,
+    params: *const PaimonVindexSearchParamsEx,
+    centroid: usize,
+    roaring_filter: *const u8,
+    roaring_filter_len: usize,
+    out_ids: *mut i64,
+    out_distances: *mut f32,
+    result_len: usize,
+) -> c_int {
+    ffi_status(|| {
+        let handle = unsafe { reader_mut(handle) }?;
+        let query = unsafe { const_slice(query, handle.inner.dimension(), "query") }?;
+        let filter = unsafe { const_slice(roaring_filter, roaring_filter_len, "roaring_filter") }?;
+        let params = unsafe { search_params_ex_from_ffi(params) }?;
+        let (ids, distances) = handle
+            .inner
+            .search_routed_ivf_shard_with_roaring_filter(query, params, centroid, filter)
+            .map_err(|e| format!("search_routed_ivf_shard_with_roaring_filter: {}", e))?;
+        copy_search_result(
+            &ids,
+            &distances,
+            out_ids,
+            out_distances,
+            result_len,
+            params.top_k,
+        )
+    })
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn paimon_vindex_reader_search_batch(
     handle: *mut PaimonVindexReaderHandle,
     queries: *const f32,
@@ -1332,6 +1393,79 @@ pub unsafe extern "C" fn paimon_vindex_reader_search_batch_with_roaring_filter_v
             .inner
             .search_batch_with_roaring_filter(queries, query_count, params, filter)
             .map_err(|e| format!("search_batch_with_roaring_filter: {}", e))?;
+        copy_search_result(
+            &ids,
+            &distances,
+            out_ids,
+            out_distances,
+            result_len,
+            expected_len,
+        )
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_reader_search_routed_ivf_shard_batch_ex(
+    handle: *mut PaimonVindexReaderHandle,
+    queries: *const f32,
+    query_count: usize,
+    params: *const PaimonVindexSearchParamsEx,
+    centroid: usize,
+    out_ids: *mut i64,
+    out_distances: *mut f32,
+    result_len: usize,
+) -> c_int {
+    ffi_status(|| {
+        let handle = unsafe { reader_mut(handle) }?;
+        let query_len = checked_len(query_count, handle.inner.dimension(), "queries")?;
+        let queries = unsafe { const_slice(queries, query_len, "queries") }?;
+        let params = unsafe { search_params_ex_from_ffi(params) }?;
+        let expected_len = checked_len(query_count, params.top_k, "batch result")?;
+        let (ids, distances) = handle
+            .inner
+            .search_routed_ivf_shard_batch(queries, query_count, params, centroid)
+            .map_err(|e| format!("search_routed_ivf_shard_batch: {}", e))?;
+        copy_search_result(
+            &ids,
+            &distances,
+            out_ids,
+            out_distances,
+            result_len,
+            expected_len,
+        )
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vindex_reader_search_routed_ivf_shard_batch_with_roaring_filter_ex(
+    handle: *mut PaimonVindexReaderHandle,
+    queries: *const f32,
+    query_count: usize,
+    params: *const PaimonVindexSearchParamsEx,
+    centroid: usize,
+    roaring_filter: *const u8,
+    roaring_filter_len: usize,
+    out_ids: *mut i64,
+    out_distances: *mut f32,
+    result_len: usize,
+) -> c_int {
+    ffi_status(|| {
+        let handle = unsafe { reader_mut(handle) }?;
+        let query_len = checked_len(query_count, handle.inner.dimension(), "queries")?;
+        let queries = unsafe { const_slice(queries, query_len, "queries") }?;
+        let filter = unsafe { const_slice(roaring_filter, roaring_filter_len, "roaring_filter") }?;
+        let params = unsafe { search_params_ex_from_ffi(params) }?;
+        let expected_len = checked_len(query_count, params.top_k, "batch result")?;
+        let (ids, distances) = handle
+            .inner
+            .search_routed_ivf_shard_batch_with_roaring_filter(
+                queries,
+                query_count,
+                params,
+                centroid,
+                filter,
+            )
+            .map_err(|e| format!("search_routed_ivf_shard_batch_with_roaring_filter: {}", e))?;
         copy_search_result(
             &ids,
             &distances,

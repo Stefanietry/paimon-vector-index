@@ -156,6 +156,18 @@ class PaimonVindexSearchParamsV2(Structure):
     ]
 
 
+class PaimonVindexSearchParamsEx(Structure):
+    _fields_ = [
+        ("struct_size", c_size_t),
+        ("top_k", c_size_t),
+        ("search_width", c_uint32),
+        ("width", c_size_t),
+        ("max_initial_filter_expansion_factor", c_size_t),
+        ("ivfpq_batch_table_reuse", c_uint32),
+        ("ivfpq_batch_table_reuse_max_bytes", c_size_t),
+    ]
+
+
 class PaimonVindexReaderOptions(Structure):
     _fields_ = [
         ("memory_budget_bytes", c_size_t),
@@ -291,6 +303,30 @@ lib.paimon_vindex_reader_search_with_roaring_filter.argtypes = [
 ]
 lib.paimon_vindex_reader_search_with_roaring_filter.restype = c_int
 
+lib.paimon_vindex_reader_search_routed_ivf_shard_ex.argtypes = [
+    c_void_p,
+    POINTER(c_float),
+    POINTER(PaimonVindexSearchParamsEx),
+    c_size_t,
+    POINTER(c_int64),
+    POINTER(c_float),
+    c_size_t,
+]
+lib.paimon_vindex_reader_search_routed_ivf_shard_ex.restype = c_int
+
+lib.paimon_vindex_reader_search_routed_ivf_shard_with_roaring_filter_ex.argtypes = [
+    c_void_p,
+    POINTER(c_float),
+    POINTER(PaimonVindexSearchParamsEx),
+    c_size_t,
+    POINTER(c_uint8),
+    c_size_t,
+    POINTER(c_int64),
+    POINTER(c_float),
+    c_size_t,
+]
+lib.paimon_vindex_reader_search_routed_ivf_shard_with_roaring_filter_ex.restype = c_int
+
 lib.paimon_vindex_reader_search_batch.argtypes = [
     c_void_p,
     POINTER(c_float),
@@ -338,3 +374,29 @@ lib.paimon_vindex_reader_search_batch_with_roaring_filter_v2.argtypes = [
     c_size_t,
 ]
 lib.paimon_vindex_reader_search_batch_with_roaring_filter_v2.restype = c_int
+
+lib.paimon_vindex_reader_search_routed_ivf_shard_batch_ex.argtypes = [
+    c_void_p,
+    POINTER(c_float),
+    c_size_t,
+    POINTER(PaimonVindexSearchParamsEx),
+    c_size_t,
+    POINTER(c_int64),
+    POINTER(c_float),
+    c_size_t,
+]
+lib.paimon_vindex_reader_search_routed_ivf_shard_batch_ex.restype = c_int
+
+lib.paimon_vindex_reader_search_routed_ivf_shard_batch_with_roaring_filter_ex.argtypes = [
+    c_void_p,
+    POINTER(c_float),
+    c_size_t,
+    POINTER(PaimonVindexSearchParamsEx),
+    c_size_t,
+    POINTER(c_uint8),
+    c_size_t,
+    POINTER(c_int64),
+    POINTER(c_float),
+    c_size_t,
+]
+lib.paimon_vindex_reader_search_routed_ivf_shard_batch_with_roaring_filter_ex.restype = c_int

@@ -18,6 +18,7 @@
 package org.apache.paimon.index.vector;
 
 import java.io.ByteArrayOutputStream;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -41,6 +42,8 @@ public class VectorIndexNativeValidationTest {
         testHighLevelTrainingInfersDimensionAndIvfShape();
         testHighLevelTrainingPreservesExpectedVectorCount();
         testSupportedIndexRoundtrips();
+        testSingleCentroidIvfPqRoutedSearch();
+        testSingleCentroidIvfPqRoutedBatchSearch();
         testDiskAnnInnerProductAndCosine();
     }
 
@@ -491,6 +494,106 @@ public class VectorIndexNativeValidationTest {
         }
     }
 
+    private static void testSingleCentroidIvfPqRoutedSearch() {
+        int dimension = 8;
+        int vectorCount = 128;
+        float[] data = new float[vectorCount * dimension];
+        long[] ids = new long[vectorCount];
+        for (int row = 0; row < vectorCount; row++) {
+            ids[row] = 1000L + row;
+            for (int column = 0; column < dimension; column++) {
+                data[row * dimension + column] = column * 0.01f + row * 0.0001f;
+            }
+        }
+
+        Map<String, String> options = ivfPqOptions(dimension, 1);
+        options.put("ivf.pq-encoding", "canonical");
+        byte[] indexBytes = buildIndexBytes(options, data, ids, vectorCount);
+        VectorIndexReader reader =
+                new VectorIndexReader(new ByteArraySeekableInputStream(indexBytes));
+        try {
+            assertEquals(1, reader.metadata().nlist());
+            VectorSearchParams params = new VectorSearchParams(5, 1);
+            float[] query = copyVectors(data, dimension, 0, 1);
+
+            VectorSearchResult regular = reader.search(query, params);
+            VectorSearchResult routed = reader.searchRoutedIvfShard(query, params, 0);
+
+            assertArrayEquals(regular.ids(), routed.ids());
+            assertArrayEquals(regular.distances(), routed.distances());
+            assertEquals(1000L, routed.ids()[0]);
+            assertThrowsMessage(
+                    RuntimeException.class,
+                    "out of range",
+                    new ThrowingRunnable() {
+                        @Override
+                        public void run() {
+                            reader.searchRoutedIvfShard(query, params, 1);
+                        }
+                    });
+        } finally {
+            reader.close();
+        }
+    }
+
+    private static void testSingleCentroidIvfPqRoutedBatchSearch() {
+        int dimension = 8;
+        int vectorCount = 128;
+        int queryCount = 3;
+        float[] data = new float[vectorCount * dimension];
+        long[] ids = new long[vectorCount];
+        for (int row = 0; row < vectorCount; row++) {
+            ids[row] = 1000L + row;
+            for (int column = 0; column < dimension; column++) {
+                data[row * dimension + column] = column * 0.01f + row * 0.0001f;
+            }
+        }
+
+        Map<String, String> options = ivfPqOptions(dimension, 1);
+        options.put("ivf.pq-encoding", "canonical");
+        byte[] indexBytes = buildIndexBytes(options, data, ids, vectorCount);
+        VectorIndexReader reader =
+                new VectorIndexReader(new ByteArraySeekableInputStream(indexBytes));
+        try {
+            assertEquals(1, reader.metadata().nlist());
+            VectorSearchParams params =
+                    new VectorSearchParams(4, 1)
+                            .withIvfPqBatchTableReuse(IvfPqBatchTableReuseMode.OFF)
+                            .withIvfPqBatchTableReuseMaxBytes(1);
+            float[] queries = copyVectors(data, dimension, 0, queryCount);
+
+            VectorSearchBatchResult regular = reader.searchBatch(queries, queryCount, params);
+            VectorSearchBatchResult routed =
+                    reader.searchRoutedIvfShardBatch(queries, queryCount, params, 0);
+
+            assertEquals(queryCount, routed.queryCount());
+            assertEquals(params.topK(), routed.topK());
+            for (int queryIndex = 0; queryIndex < queryCount; queryIndex++) {
+                assertArrayEquals(
+                        sortedCopy(regular.idsForQuery(queryIndex)),
+                        sortedCopy(routed.idsForQuery(queryIndex)));
+                assertArrayEquals(
+                        sortedCopy(regular.distancesForQuery(queryIndex)),
+                        sortedCopy(routed.distancesForQuery(queryIndex)));
+                assertEquals(1000L + queryIndex, routed.idsForQuery(queryIndex)[0]);
+                assertFinite(
+                        routed.distancesForQuery(queryIndex)[0],
+                        "routed IVF-PQ batch distance " + queryIndex);
+            }
+            assertThrowsMessage(
+                    RuntimeException.class,
+                    "out of range",
+                    new ThrowingRunnable() {
+                        @Override
+                        public void run() {
+                            reader.searchRoutedIvfShardBatch(queries, queryCount, params, 1);
+                        }
+                    });
+        } finally {
+            reader.close();
+        }
+    }
+
     private static void runRoundtrip(
             String indexType, Map<String, String> options, int expectedPqM, int expectedPqBits) {
         byte[] indexBytes =
@@ -755,6 +858,28 @@ public class VectorIndexNativeValidationTest {
                         "expected[" + i + "] " + expected[i] + " but got " + actual[i]);
             }
         }
+    }
+
+    private static void assertArrayEquals(float[] expected, float[] actual) {
+        if (expected.length != actual.length) {
+            throw new AssertionError(
+                    "expected length " + expected.length + " but got " + actual.length);
+        }
+        for (int i = 0; i < expected.length; i++) {
+            assertNear(expected[i], actual[i], 0.0f);
+        }
+    }
+
+    private static long[] sortedCopy(long[] values) {
+        long[] copy = values.clone();
+        Arrays.sort(copy);
+        return copy;
+    }
+
+    private static float[] sortedCopy(float[] values) {
+        float[] copy = values.clone();
+        Arrays.sort(copy);
+        return copy;
     }
 
     private static void assertIdInCluster(long id, int cluster) {

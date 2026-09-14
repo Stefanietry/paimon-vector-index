@@ -246,6 +246,22 @@ class SearchParams:
             self.ivfpq_batch_table_reuse_max_bytes,
         )
 
+    def to_ffi_ex(self):
+        params = _ffi.PaimonVindexSearchParamsEx()
+        params.struct_size = (
+            _ffi.PaimonVindexSearchParamsEx.ivfpq_batch_table_reuse_max_bytes.offset
+            + ctypes.sizeof(ctypes.c_size_t)
+        )
+        params.top_k = self.top_k
+        params.search_width = int(self.search_width)
+        params.width = self.width
+        params.max_initial_filter_expansion_factor = 0
+        params.ivfpq_batch_table_reuse = int(self.ivfpq_batch_table_reuse)
+        params.ivfpq_batch_table_reuse_max_bytes = (
+            self.ivfpq_batch_table_reuse_max_bytes
+        )
+        return params
+
 
 def _check_error(message="operation failed"):
     err = lib.paimon_vindex_last_error()
@@ -810,6 +826,56 @@ class VectorIndexReader:
                 _check_error("search failed")
         return ids, distances
 
+    def search_routed_ivf_shard(
+        self, query, params: SearchParams, centroid: int, filter_bytes=None
+    ):
+        """Search one routed IVF-PQ centroid list.
+
+        The returned arrays always have ``params.top_k`` entries. If the selected
+        list has fewer matches, missing rows are padded as id ``-1`` and distance
+        ``np.finfo(np.float32).max``. L2 residual/precomputed IVF-PQ indexes still
+        use the selected centroid vector as the residual distance anchor.
+        """
+        query = _float32_vector(query, "query")
+        if query.shape[0] != self._metadata.dimension:
+            raise RuntimeError(
+                f"query length {query.shape[0]} does not match index dimension "
+                f"{self._metadata.dimension}"
+            )
+        centroid = _size_t(centroid, "centroid", allow_zero=True)
+        ffi_params = params.to_ffi_ex()
+        ids = np.empty(params.top_k, dtype=np.int64)
+        distances = np.empty(params.top_k, dtype=np.float32)
+
+        with self._native_handle_lock:
+            self._require_open()
+            if filter_bytes is None:
+                rc = lib.paimon_vindex_reader_search_routed_ivf_shard_ex(
+                    self._handle,
+                    query.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    ctypes.byref(ffi_params),
+                    centroid,
+                    ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+                    distances.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    params.top_k,
+                )
+            else:
+                filter_buf, filter_len, _ = self._filter_args(filter_bytes)
+                rc = lib.paimon_vindex_reader_search_routed_ivf_shard_with_roaring_filter_ex(
+                    self._handle,
+                    query.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    ctypes.byref(ffi_params),
+                    centroid,
+                    filter_buf,
+                    filter_len,
+                    ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+                    distances.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    params.top_k,
+                )
+            if rc != 0:
+                _check_error("routed IVF shard search failed")
+        return ids, distances
+
     def search_batch(self, queries, params: SearchParams, filter_bytes=None):
         queries = _float32_matrix(queries, "queries")
         if queries.shape[1] != self._metadata.dimension:
@@ -849,6 +915,58 @@ class VectorIndexReader:
                 )
             if rc != 0:
                 _check_error("batch search failed")
+        return ids, distances
+
+    def search_routed_ivf_shard_batch(
+        self, queries, params: SearchParams, centroid: int, filter_bytes=None
+    ):
+        """Batch-search one routed IVF-PQ centroid list.
+
+        The returned matrices always have shape ``(nq, params.top_k)``. Per-query
+        rows with fewer matches are padded as id ``-1`` and distance
+        ``np.finfo(np.float32).max``.
+        """
+        queries = _float32_matrix(queries, "queries")
+        if queries.shape[1] != self._metadata.dimension:
+            raise RuntimeError(
+                f"queries length {queries.size} does not match nq * dimension "
+                f"{queries.shape[0] * self._metadata.dimension}"
+            )
+        centroid = _size_t(centroid, "centroid", allow_zero=True)
+        ffi_params = params.to_ffi_ex()
+        result_len = queries.shape[0] * params.top_k
+        ids = np.empty((queries.shape[0], params.top_k), dtype=np.int64)
+        distances = np.empty((queries.shape[0], params.top_k), dtype=np.float32)
+
+        with self._native_handle_lock:
+            self._require_open()
+            if filter_bytes is None:
+                rc = lib.paimon_vindex_reader_search_routed_ivf_shard_batch_ex(
+                    self._handle,
+                    queries.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    queries.shape[0],
+                    ctypes.byref(ffi_params),
+                    centroid,
+                    ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+                    distances.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    result_len,
+                )
+            else:
+                filter_buf, filter_len, _ = self._filter_args(filter_bytes)
+                rc = lib.paimon_vindex_reader_search_routed_ivf_shard_batch_with_roaring_filter_ex(
+                    self._handle,
+                    queries.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    queries.shape[0],
+                    ctypes.byref(ffi_params),
+                    centroid,
+                    filter_buf,
+                    filter_len,
+                    ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+                    distances.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    result_len,
+                )
+            if rc != 0:
+                _check_error("routed IVF shard batch search failed")
         return ids, distances
 
     def close(self):
