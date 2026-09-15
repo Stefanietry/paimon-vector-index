@@ -619,6 +619,36 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_cre
 }
 
 #[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_createRoutedIvfCentroidWriter(
+    env: JNIEnv,
+    _class: JClass,
+    training_ptr: jlong,
+    centroid: jint,
+) -> jlong {
+    jni_call(env, |env| {
+        if training_ptr == 0 {
+            return throw_and_return(env, "null native pointer (training already freed?)");
+        }
+        if centroid < 0 {
+            return throw_and_return(env, &format!("invalid centroid: {}", centroid));
+        }
+        let mut training_handle =
+            unsafe { Box::from_raw(training_ptr as *mut JniVectorIndexTraining) };
+        let training = match training_handle.take() {
+            Ok(training) => training,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let writer = match VectorIndexWriter::new_routed_ivf_centroid(training, centroid as usize) {
+            Ok(writer) => writer,
+            Err(e) => {
+                return throw_and_return(env, &format!("create routed IVF centroid writer: {}", e))
+            }
+        };
+        Box::into_raw(Box::new(JniVectorIndexWriter::new(writer))) as jlong
+    })
+}
+
+#[no_mangle]
 pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_freeTraining(
     env: JNIEnv,
     _class: JClass,
@@ -676,6 +706,41 @@ pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_add
         };
         if let Err(e) = writer.writer.add_vectors(&id_buf, &data_buf, n) {
             throw_and_return::<()>(env, &format!("add_vectors: {}", e));
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_vector_VectorIndexNative_addRoutedIvfCentroidVectors(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+    ids: JLongArray,
+    data: JFloatArray,
+    n: jint,
+) {
+    jni_call_void(env, |env| {
+        let writer = match deref_writer(ptr) {
+            Some(writer) => writer,
+            None => return throw_and_return(env, "null native pointer (writer already freed?)"),
+        };
+        if n < 0 {
+            return throw_and_return(env, &format!("invalid vector count: {}", n));
+        }
+        let n = n as usize;
+        let id_buf = match read_long_array(env, &ids, "ids") {
+            Ok(buf) => buf,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        let data_buf = match read_float_array(env, &data, "vectors") {
+            Ok(buf) => buf,
+            Err(e) => return throw_and_return(env, &e),
+        };
+        if let Err(e) = writer
+            .writer
+            .add_routed_ivf_centroid_vectors(&id_buf, &data_buf, n)
+        {
+            throw_and_return::<()>(env, &format!("add_routed_ivf_centroid_vectors: {}", e));
         }
     })
 }

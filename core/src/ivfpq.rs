@@ -81,6 +81,7 @@ pub struct IVFPQIndex {
     fastscan_codes: Vec<Vec<u8>>,
     coarse_assignment: CoarseAssignment,
     canonical_pq_encoding: bool,
+    routed_centroid: Option<usize>,
 }
 
 impl IVFPQIndex {
@@ -119,6 +120,7 @@ impl IVFPQIndex {
             fastscan_codes: Vec::new(),
             coarse_assignment: CoarseAssignment::default(),
             canonical_pq_encoding: false,
+            routed_centroid: None,
         }
     }
 
@@ -134,6 +136,19 @@ impl IVFPQIndex {
             "cannot change PQ encoding after vectors have been added"
         );
         self.canonical_pq_encoding = canonical;
+    }
+
+    pub(crate) fn set_routed_centroid(&mut self, centroid: usize) {
+        assert!(centroid < self.nlist, "centroid out of range");
+        assert!(
+            self.ids.iter().all(Vec::is_empty),
+            "cannot set routed centroid after vectors have been added"
+        );
+        self.routed_centroid = Some(centroid);
+    }
+
+    pub(crate) fn routed_centroid(&self) -> Option<usize> {
+        self.routed_centroid
     }
 
     /// Enables automatic Vamana coarse assignment for large centroid matrices.
@@ -203,6 +218,7 @@ impl IVFPQIndex {
             fastscan_codes: Vec::new(),
             coarse_assignment: CoarseAssignment::default(),
             canonical_pq_encoding: trained.canonical_pq_encoding,
+            routed_centroid: None,
         };
         index.set_approximate_coarse_assignment(trained.coarse_assignment.approximate_enabled());
         index
@@ -286,6 +302,23 @@ impl IVFPQIndex {
         }
     }
 
+    /// Add vectors that have already been routed to one IVF centroid.
+    pub fn add_to_centroid(&mut self, data: &[f32], ids: &[i64], n: usize, centroid: usize) {
+        assert!(centroid < self.nlist, "centroid out of range");
+        const BATCH_SIZE: usize = 32768;
+        let mut offset = 0;
+        while offset < n {
+            let batch_n = (n - offset).min(BATCH_SIZE);
+            self.add_batch_to_centroid(
+                &data[offset * self.d..(offset + batch_n) * self.d],
+                &ids[offset..offset + batch_n],
+                batch_n,
+                centroid,
+            );
+            offset += batch_n;
+        }
+    }
+
     fn add_batch(&mut self, data: &[f32], ids: &[i64], n: usize) {
         let d = self.d;
 
@@ -326,6 +359,47 @@ impl IVFPQIndex {
             let list_id = assignments[i];
             self.ids[list_id].push(ids[i]);
             self.codes[list_id].extend_from_slice(&codes[i * code_size..(i + 1) * code_size]);
+        }
+
+        if !self.fastscan_codes.is_empty() {
+            self.fastscan_codes.clear();
+        }
+        if !self.precomputed_table.is_empty() {
+            self.precomputed_table.clear();
+        }
+    }
+
+    fn add_batch_to_centroid(&mut self, data: &[f32], ids: &[i64], n: usize, centroid: usize) {
+        let d = self.d;
+
+        // L2/IP without OPQ borrows the caller's batch instead of copying it.
+        let processed = self.preprocess_queries(data, n);
+
+        let to_encode = if self.by_residual {
+            let mut residuals = vec![0.0f32; n * d];
+            let centroid_vector = &self.quantizer_centroids[centroid * d..(centroid + 1) * d];
+            residuals
+                .par_chunks_mut(d)
+                .enumerate()
+                .for_each(|(i, res)| {
+                    fvec_madd(&processed[i * d..(i + 1) * d], centroid_vector, -1.0, res);
+                });
+            Cow::Owned(residuals)
+        } else {
+            processed
+        };
+
+        let code_size = self.pq.code_size();
+        let mut codes = vec![0u8; n * code_size];
+        if self.canonical_pq_encoding {
+            self.pq.encode_batch(&to_encode, n, &mut codes);
+        } else {
+            self.pq.encode_batch_blocked(&to_encode, n, &mut codes);
+        }
+
+        for i in 0..n {
+            self.ids[centroid].push(ids[i]);
+            self.codes[centroid].extend_from_slice(&codes[i * code_size..(i + 1) * code_size]);
         }
 
         if !self.fastscan_codes.is_empty() {

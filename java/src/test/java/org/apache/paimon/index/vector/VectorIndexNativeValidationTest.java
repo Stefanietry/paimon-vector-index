@@ -42,6 +42,8 @@ public class VectorIndexNativeValidationTest {
         testHighLevelTrainingInfersDimensionAndIvfShape();
         testHighLevelTrainingPreservesExpectedVectorCount();
         testSupportedIndexRoundtrips();
+        testCentroidRoutedIvfPqWriterRoundtrip();
+        testCentroidRoutedIvfPqWriterValidation();
         testSingleCentroidIvfPqRoutedSearch();
         testSingleCentroidIvfPqRoutedBatchSearch();
         testDiskAnnInnerProductAndCosine();
@@ -536,6 +538,129 @@ public class VectorIndexNativeValidationTest {
         }
     }
 
+    private static void testCentroidRoutedIvfPqWriterRoundtrip() {
+        int dimension = 8;
+        int nlist = 4;
+        int trainingCount = 512;
+        float[] data = clusteredData(trainingCount, dimension, nlist);
+        long[] ids = new long[] {10_000L, 10_001L, 10_002L};
+        int centroid = 2;
+
+        Map<String, String> options = ivfPqOptions(dimension, nlist);
+        options.put("ivf.pq-encoding", "canonical");
+        VectorIndexTraining training = VectorIndexTrainer.train(options, data, trainingCount);
+        VectorIndexWriter writer = new VectorIndexWriter(training, centroid);
+        ByteArrayPositionOutputStream output = new ByteArrayPositionOutputStream();
+        try {
+            writer.addRoutedIvfCentroidVectors(
+                    ids, copyVectors(data, dimension, 0, ids.length), ids.length);
+            writer.writeIndex(output);
+        } finally {
+            writer.close();
+        }
+
+        VectorIndexReader reader =
+                new VectorIndexReader(new ByteArraySeekableInputStream(output.toByteArray()));
+        try {
+            assertEquals((long) ids.length, reader.metadata().totalVectors());
+            VectorSearchResult result =
+                    reader.searchRoutedIvfShard(
+                            copyVectors(data, dimension, 0, 1),
+                            new VectorSearchParams(ids.length, 1),
+                            centroid);
+            assertArrayEquals(ids, sortedCopy(result.ids()));
+        } finally {
+            reader.close();
+        }
+    }
+
+    private static void testCentroidRoutedIvfPqWriterValidation() {
+        int dimension = 8;
+        float[] data = clusteredData(128, dimension, 2);
+        final VectorIndexTraining negativeCentroidTraining =
+                VectorIndexTrainer.train(ivfPqOptions(dimension, 2), data, 128);
+        assertThrowsMessage(
+                IllegalArgumentException.class,
+                "centroid must be non-negative",
+                new ThrowingRunnable() {
+                    @Override
+                    public void run() {
+                        new VectorIndexWriter(negativeCentroidTraining, -1);
+                    }
+                });
+        VectorIndexWriter negativeCentroidReusableWriter =
+                new VectorIndexWriter(negativeCentroidTraining, 0);
+        negativeCentroidReusableWriter.close();
+
+        final VectorIndexTraining ivfpqTraining =
+                VectorIndexTrainer.train(ivfPqOptions(dimension, 2), data, 128);
+        assertThrowsMessage(
+                RuntimeException.class,
+                "out of range",
+                new ThrowingRunnable() {
+                    @Override
+                    public void run() {
+                        new VectorIndexWriter(ivfpqTraining, 2);
+                    }
+                });
+
+        final VectorIndexTraining ivfflatTraining =
+                VectorIndexTrainer.train(ivfFlatOptions(dimension, 2), data, 128);
+        assertThrowsMessage(
+                RuntimeException.class,
+                "requires IVF-PQ training",
+                new ThrowingRunnable() {
+                    @Override
+                    public void run() {
+                        new VectorIndexWriter(ivfflatTraining, 0);
+                    }
+                });
+
+        VectorIndexTraining routedTraining =
+                VectorIndexTrainer.train(ivfPqOptions(dimension, 2), data, 128);
+        VectorIndexWriter writer = new VectorIndexWriter(routedTraining, 0);
+        try {
+            assertThrowsMessage(
+                    RuntimeException.class,
+                    "use add_routed_ivf_centroid_vectors",
+                    new ThrowingRunnable() {
+                        @Override
+                        public void run() {
+                            writer.addVectors(
+                                    new long[] {1L}, copyVectors(data, dimension, 0, 1), 1);
+                        }
+                    });
+            assertThrowsMessage(
+                    RuntimeException.class,
+                    "requires a centroid-routed IVF-PQ writer",
+                    new ThrowingRunnable() {
+                        @Override
+                        public void run() {
+                            VectorIndexWriter regularWriter =
+                                    newWriter(ivfPqOptions(dimension, 2), data, 128);
+                            try {
+                                regularWriter.addRoutedIvfCentroidVectors(
+                                        new long[] {1L}, copyVectors(data, dimension, 0, 1), 1);
+                            } finally {
+                                regularWriter.close();
+                            }
+                        }
+                    });
+            assertThrowsMessage(
+                    RuntimeException.class,
+                    "ids length 2 does not match vector count 1",
+                    new ThrowingRunnable() {
+                        @Override
+                        public void run() {
+                            writer.addRoutedIvfCentroidVectors(
+                                    new long[] {1L, 2L}, copyVectors(data, dimension, 0, 1), 1);
+                        }
+                    });
+        } finally {
+            writer.close();
+        }
+    }
+
     private static void testSingleCentroidIvfPqRoutedBatchSearch() {
         int dimension = 8;
         int vectorCount = 128;
@@ -731,6 +856,18 @@ public class VectorIndexNativeValidationTest {
         float[] copy = new float[count * dimension];
         System.arraycopy(data, offset * dimension, copy, 0, copy.length);
         return copy;
+    }
+
+    private static float[] clusteredData(int vectorCount, int dimension, int clusters) {
+        float[] data = new float[vectorCount * dimension];
+        for (int row = 0; row < vectorCount; row++) {
+            int cluster = row % clusters;
+            for (int column = 0; column < dimension; column++) {
+                data[row * dimension + column] =
+                        cluster * 20.0f + column * 0.01f + row * 0.0001f;
+            }
+        }
+        return data;
     }
 
     private static Map<String, String> ivfFlatOptions() {

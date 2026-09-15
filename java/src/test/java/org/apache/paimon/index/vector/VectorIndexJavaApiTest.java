@@ -314,6 +314,12 @@ public class VectorIndexJavaApiTest {
         assertThrows(IllegalStateException.class, new ThrowingRunnable() {
             @Override
             public void run() {
+                writer.addRoutedIvfCentroidVectors(new long[] {1L}, new float[] {0.0f, 1.0f}, 1);
+            }
+        });
+        assertThrows(IllegalStateException.class, new ThrowingRunnable() {
+            @Override
+            public void run() {
                 writer.writeIndex(new Object());
             }
         });
@@ -353,6 +359,12 @@ public class VectorIndexJavaApiTest {
             @Override
             public void run() {
                 new VectorIndexWriter(training);
+            }
+        });
+        assertThrows(IllegalStateException.class, new ThrowingRunnable() {
+            @Override
+            public void run() {
+                new VectorIndexWriter(training, 0);
             }
         });
     }
@@ -413,6 +425,13 @@ public class VectorIndexJavaApiTest {
             writer.dimension();
             writer.addVectors(new long[] {1L, 2L}, new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2);
             writer.writeIndex(new Object());
+
+            VectorIndexTraining routedTraining =
+                    VectorIndexTrainer.train(options, new float[] {0.0f, 1.0f, 2.0f, 3.0f}, 2);
+            VectorIndexWriter routedWriter = new VectorIndexWriter(routedTraining, 0);
+            routedWriter.addRoutedIvfCentroidVectors(
+                    new long[] {1L}, new float[] {0.0f, 1.0f}, 1);
+            routedWriter.writeIndex(new Object());
 
             VectorIndexTrainer trainer = VectorIndexTrainer.create(options);
             trainer.dimension();

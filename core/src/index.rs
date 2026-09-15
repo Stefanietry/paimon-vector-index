@@ -1427,6 +1427,28 @@ impl VectorIndexWriter {
         training.inner
     }
 
+    pub fn new_routed_ivf_centroid(
+        training: VectorIndexTraining,
+        centroid: usize,
+    ) -> io::Result<Self> {
+        match training.inner {
+            Self::IvfPq(mut index) => {
+                if centroid >= index.nlist {
+                    return Err(invalid_input(format!(
+                        "centroid {} out of range (nlist={})",
+                        centroid, index.nlist
+                    )));
+                }
+                index.set_routed_centroid(centroid);
+                Ok(Self::IvfPq(index))
+            }
+            other => Err(invalid_input(format!(
+                "centroid-routed writer requires IVF-PQ training, got {:?}",
+                other.index_type()
+            ))),
+        }
+    }
+
     fn from_config(config: VectorIndexConfig) -> io::Result<Self> {
         validate_config(&config)?;
         Ok(match config {
@@ -1541,9 +1563,48 @@ impl VectorIndexWriter {
         match self {
             Self::IvfFlat(index) => index.add(data, ids, n),
             Self::IvfSq(index) => index.add(data, ids, n),
-            Self::IvfPq(index) => index.add(data, ids, n),
+            Self::IvfPq(index) => {
+                if index.routed_centroid().is_some() {
+                    return Err(invalid_input(
+                        "add_vectors is not supported by a centroid-routed IVF-PQ writer; use add_routed_ivf_centroid_vectors",
+                    ));
+                }
+                index.add(data, ids, n);
+            }
             Self::IvfRq(index) => index.add(data, ids, n),
             Self::DiskAnn(index) => index.add(data, ids),
+        }
+        Ok(())
+    }
+
+    pub fn add_routed_ivf_centroid_vectors(
+        &mut self,
+        ids: &[i64],
+        data: &[f32],
+        n: usize,
+    ) -> io::Result<()> {
+        validate_vectors(data, n, self.dimension(), "vector data")?;
+        if ids.len() != n {
+            return Err(invalid_input(format!(
+                "ids length {} does not match vector count {}",
+                ids.len(),
+                n
+            )));
+        }
+        match self {
+            Self::IvfPq(index) => {
+                let Some(centroid) = index.routed_centroid() else {
+                    return Err(invalid_input(
+                        "add_routed_ivf_centroid_vectors requires a centroid-routed IVF-PQ writer",
+                    ));
+                };
+                index.add_to_centroid(data, ids, n, centroid);
+            }
+            _ => {
+                return Err(invalid_input(
+                    "add_routed_ivf_centroid_vectors requires a centroid-routed IVF-PQ writer",
+                ))
+            }
         }
         Ok(())
     }
@@ -2997,6 +3058,105 @@ mod tests {
     fn build_writer(config: VectorIndexConfig, data: &[f32], n: usize) -> VectorIndexWriter {
         let training = VectorIndexTrainer::train(config, data, n).unwrap();
         VectorIndexWriter::new(training)
+    }
+
+    #[test]
+    fn routed_ivfpq_writer_adds_vectors_to_configured_centroid() {
+        let dimension = 16;
+        let nlist = 4;
+        let training_count = 512;
+        let data = generate_clustered_data(training_count, dimension, nlist);
+        let training = VectorIndexTrainer::train(
+            VectorIndexConfig::IvfPq {
+                dimension,
+                nlist,
+                m: 4,
+                metric: MetricType::L2,
+                use_opq: false,
+                use_approximate_coarse_assignment: true,
+                canonical_pq_encoding: false,
+                ivf_train_max_points_per_centroid: 256,
+                pq_train_max_points_per_centroid: 256,
+            },
+            &data,
+            training_count,
+        )
+        .unwrap();
+
+        let centroid = 2;
+        let mut writer = VectorIndexWriter::new_routed_ivf_centroid(training, centroid).unwrap();
+        let routed_ids = [10_000, 10_001, 10_002];
+        let err = writer
+            .add_vectors(&routed_ids[..1], &data[..dimension], 1)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err
+            .to_string()
+            .contains("use add_routed_ivf_centroid_vectors"));
+        writer
+            .add_routed_ivf_centroid_vectors(
+                &routed_ids,
+                &data[..routed_ids.len() * dimension],
+                routed_ids.len(),
+            )
+            .unwrap();
+
+        let mut bytes = Vec::new();
+        writer.write(&mut PosWriter::new(&mut bytes)).unwrap();
+        let mut reader = VectorIndexReader::open(Cursor::new(bytes)).unwrap();
+        assert_eq!(reader.metadata().total_vectors, routed_ids.len() as i64);
+        for list_id in 0..nlist {
+            let list_row_ids = ivfpq_list_row_ids(&mut reader, list_id);
+            if list_id == centroid {
+                assert_eq!(list_row_ids, routed_ids.into_iter().collect());
+            } else {
+                assert!(list_row_ids.is_empty(), "list {list_id} should be empty");
+            }
+        }
+    }
+
+    #[test]
+    fn routed_ivfpq_writer_validates_training_type_and_centroid() {
+        let data = generate_clustered_data(128, 8, 2);
+        let ivfpq_training = VectorIndexTrainer::train(
+            VectorIndexConfig::IvfPq {
+                dimension: 8,
+                nlist: 2,
+                m: 2,
+                metric: MetricType::L2,
+                use_opq: false,
+                use_approximate_coarse_assignment: true,
+                canonical_pq_encoding: false,
+                ivf_train_max_points_per_centroid: 256,
+                pq_train_max_points_per_centroid: 256,
+            },
+            &data,
+            128,
+        )
+        .unwrap();
+        let err = match VectorIndexWriter::new_routed_ivf_centroid(ivfpq_training, 2) {
+            Ok(_) => panic!("out-of-range centroid should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let ivfflat_training = VectorIndexTrainer::train(
+            VectorIndexConfig::IvfFlat {
+                dimension: 8,
+                nlist: 2,
+                metric: MetricType::L2,
+                use_approximate_coarse_assignment: true,
+                ivf_train_max_points_per_centroid: 256,
+            },
+            &data,
+            128,
+        )
+        .unwrap();
+        let err = match VectorIndexWriter::new_routed_ivf_centroid(ivfflat_training, 0) {
+            Ok(_) => panic!("non-IVF-PQ training should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

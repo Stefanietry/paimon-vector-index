@@ -30,6 +30,18 @@ public final class VectorIndexWriter implements AutoCloseable {
         this.nativePtr = VectorIndexNative.createWriter(training.takeNativePointer());
     }
 
+    public VectorIndexWriter(VectorIndexTraining training, int centroid) {
+        if (training == null) {
+            throw new NullPointerException("training");
+        }
+        if (centroid < 0) {
+            throw new IllegalArgumentException("centroid must be non-negative");
+        }
+        this.nativePtr =
+                VectorIndexNative.createRoutedIvfCentroidWriter(
+                        training.takeNativePointer(), centroid);
+    }
+
     private VectorIndexWriter(long nativePtr) {
         this.nativePtr = nativePtr;
     }
@@ -60,6 +72,24 @@ public final class VectorIndexWriter implements AutoCloseable {
             enterNativeHandle();
             try {
                 VectorIndexNative.addVectors(requireOpen(), ids, data, vectorCount);
+            } finally {
+                exitNativeHandle();
+            }
+        }
+    }
+
+    public void addRoutedIvfCentroidVectors(long[] ids, float[] vectors, int vectorCount) {
+        if (ids == null) {
+            throw new NullPointerException("ids");
+        }
+        if (vectors == null) {
+            throw new NullPointerException("vectors");
+        }
+        synchronized (nativeHandleLock) {
+            enterNativeHandle();
+            try {
+                VectorIndexNative.addRoutedIvfCentroidVectors(
+                        requireOpen(), ids, vectors, vectorCount);
             } finally {
                 exitNativeHandle();
             }

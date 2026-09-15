@@ -37,9 +37,13 @@ final class VectorIndexNative {
 
     static native long createWriter(long trainingPtr);
 
+    static native long createRoutedIvfCentroidWriter(long trainingPtr, int centroid);
+
     static native int writerDimension(long ptr);
 
     static native void addVectors(long ptr, long[] ids, float[] data, int n);
+
+    static native void addRoutedIvfCentroidVectors(long ptr, long[] ids, float[] data, int n);
 
     static native void writeIndex(long ptr, Object streamOutput);
 
